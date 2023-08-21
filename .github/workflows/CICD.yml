@@ -1,9 +1,19 @@
 name: CICD Pipeline
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: ["main"]
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: sentiment
+  ECS_SERVICE: my-service
+  ECS_CLUSTER: my-cluster
+  ECS_TASK_DEFINITION: sample-fargate-1.json
+  CONTAINER_NAME: sentiment
+
+
+permissions:
+  contents: read
 
 
 jobs:
@@ -87,49 +97,62 @@ jobs:
         path: dist/*.whl
         retention-days: 1
 
-  push-image:
+  deploy:
     needs: [train, test, build]
+    name: Deploy
     runs-on: ubuntu-latest
+    environment: production
+
     steps:
-    - name: Repo Checkout
+    - name: Checkout
       uses: actions/checkout@v3
+
 
     - uses: actions/download-artifact@v3
       with:
         name: my-build-package
         path: sentiment_model_api
 
-    - name: Login to Docker hub
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
       env:
-        DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
-        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASS_TOKEN }}
-      run: docker login -u $DOCKER_USER -p $DOCKER_PASSWORD
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Build a docker container and
+        # push it to ECR so that it can
+        # be deployed to ECS.
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+        
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ${{ env.ECS_TASK_DEFINITION }}
+        container-name: ${{ env.CONTAINER_NAME }}
+        image: ${{ steps.build-image.outputs.image }}
 
-    - name: Build the Docker image for Fastapi app
-      env:
-        DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
-      run: docker build . -f Dockerfile -t $DOCKER_USER/sentiment-fastapi:latest
 
-    - name: Push the Docker Image
-      env:
-        DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
-      run: docker push $DOCKER_USER/sentiment-fastapi
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ env.ECS_SERVICE }}
+        cluster: ${{ env.ECS_CLUSTER }}
+        wait-for-service-stability: true
 
-    - name: Logout to Docker hub
-      run: docker logout
 
-  deploy:
-    needs: [train, test, build, push-image]
-    runs-on: self-hosted
-
-    steps:
-      - name: Pull Docker Image
-        env:
-          DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
-        run: sudo docker pull $DOCKER_USER/sentiment-fastapi:latest
-      - name: Delete Old Docker Container
-        run: sudo docker rm -f sentiment-fastapi-container || true
-      - name: Run Docker Container
-        env:
-          DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
-        run: sudo docker run -it -d -p 8001:8001 --name sentiment-fastapi-container $DOCKER_USER/sentiment-fastapi
